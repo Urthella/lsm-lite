@@ -1,0 +1,10 @@
+[package]
+name = "lsm-lite"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A small LSM-tree key-value store, tested by crashing it at every filesystem operation"
+repository = "https://github.com/Urthella/lsm-lite"
+
+[dependencies]
+crc32fast = "1"
