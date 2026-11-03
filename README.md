@@ -52,11 +52,26 @@ while something durable still points at it.
 - **The manifest**, which lists the live tables and the current log, is replaced atomically: write
   `MANIFEST.tmp`, sync it, rename it over `MANIFEST`, sync the directory.
 - **Compaction** merges every table into one in the same way, dropping deleted keys.
+- **Bloom filters** live inside the tables they describe, under the same CRC, so they're written
+  and recovered with them.
 - **Opening** reads the manifest and replays the log, stopping at the first record that's torn or
   fails its CRC. What the log held goes into a table, and writing continues in a new log, so nothing
   is ever appended after a torn end.
 - **After a failed write**, the database refuses everything until it's reopened, since what's in
   memory may no longer match the disk.
+
+## Reads
+
+A lookup checks the memtable, then the tables from newest to oldest. Each table has a sparse index
+of the first key in every block of 16 entries, so it reads at most one block. Each table also has a
+Bloom filter, 10 bits a key with 7 probes, so a table that can't hold the key isn't read at all.
+
+In a test with 12 tables whose key ranges overlap, 2,000 lookups read this many blocks:
+
+| | Missing keys | Present keys |
+| --- | ---: | ---: |
+| Without filters | 23,892 | 12,739 |
+| With filters | 208 | 2,076 |
 
 ## How it's tested
 
@@ -79,11 +94,11 @@ fully there or not at all:
   row, during flushes and compactions too. Every write it had reported was there each time. That's
   a process crash only; power loss is what the simulation is for.
 
-To check that the tests can fail, 17 bugs were planted one at a time, and every one was caught.
+To check that the tests can fail, 21 bugs were planted one at a time, and every one was caught.
 Among them: not syncing the log, not syncing the directory before the manifest names a new table,
 rewriting the manifest in place, deleting the old log before the new manifest is durable, letting
-compaction keep older values, and checking CRCs that don't cover the record length, which lets a run
-of zeros pass as an empty record.
+compaction keep older values, checking CRCs that don't cover the record length, which lets a run of
+zeros pass as an empty record, and a Bloom filter built with one probe fewer than it's checked with.
 
 This way of testing comes from work like
 [ALICE](https://www.usenix.org/conference/osdi14/technical-sessions/presentation/pillai) and
