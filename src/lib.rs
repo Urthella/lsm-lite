@@ -18,6 +18,7 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+mod bloom;
 mod fs;
 pub mod sim;
 mod sstable;

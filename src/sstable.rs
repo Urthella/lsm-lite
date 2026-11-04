@@ -3,15 +3,16 @@
 //! ```text
 //! entries  [key_len u32][kind u8][value_len u32][key][value]   sorted by key; kind 0 is a deletion
 //! index    [key_len u32][key][offset u64]                      first key of every block of entries
-//! footer   [index_offset u64][crc u32 over everything before the footer]
+//! filter   a Bloom filter of the keys
+//! footer   [index_offset u64][filter_offset u64][crc u32 over everything before the footer]
 //! ```
 
 use std::io;
 
-use crate::{Fs, Reader, corrupt, table_name};
+use crate::{Fs, Reader, bloom, corrupt, table_name};
 
 const BLOCK: usize = 16;
-const FOOTER: usize = 12;
+const FOOTER: usize = 20;
 
 type Entry = (Vec<u8>, Option<Vec<u8>>);
 
@@ -19,6 +20,7 @@ pub struct Table {
     pub id: u64,
     index: Vec<(Vec<u8>, u64)>,
     index_offset: u64,
+    filter: Vec<u8>,
 }
 
 impl Table {
@@ -30,10 +32,12 @@ impl Table {
     ) -> io::Result<Table> {
         let mut buf = Vec::new();
         let mut index = Vec::new();
+        let mut hashes = Vec::new();
         for (i, (key, value)) in entries.enumerate() {
             if i % BLOCK == 0 {
                 index.push((key.to_vec(), buf.len() as u64));
             }
+            hashes.push(bloom::hash(key));
             let value_bytes = value.unwrap_or_default();
             buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
             buf.push(value.is_some() as u8);
@@ -47,8 +51,12 @@ impl Table {
             buf.extend_from_slice(key);
             buf.extend_from_slice(&offset.to_le_bytes());
         }
+        let filter_offset = buf.len() as u64;
+        let filter = bloom::build(&hashes);
+        buf.extend_from_slice(&filter);
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&index_offset.to_le_bytes());
+        buf.extend_from_slice(&filter_offset.to_le_bytes());
         buf.extend_from_slice(&crc.to_le_bytes());
 
         let name = table_name(id);
@@ -59,6 +67,7 @@ impl Table {
             id,
             index,
             index_offset,
+            filter,
         })
     }
 
@@ -74,13 +83,16 @@ impl Table {
         let (body, footer) = buf.split_at(body_len);
         let mut footer = Reader::new(footer);
         let index_offset = footer.u64()?;
+        let filter_offset = footer.u64()?;
         if crc32fast::hash(body) != footer.u32()? {
             return Err(corrupt(&name));
         }
-        let mut r = Reader::new(
-            body.get(index_offset as usize..)
-                .ok_or_else(|| corrupt(&name))?,
-        );
+        let (index_bytes, filter) = body
+            .get(..filter_offset as usize)
+            .and_then(|before| Some((before.get(index_offset as usize..)?, &body[before.len()..])))
+            .ok_or_else(|| corrupt(&name))?;
+        let filter = filter.to_vec();
+        let mut r = Reader::new(index_bytes);
         let mut index = Vec::new();
         while !r.done() {
             let len = r.u32()? as usize;
@@ -91,11 +103,16 @@ impl Table {
             id,
             index,
             index_offset,
+            filter,
         })
     }
 
-    /// Looks up a key, reading only the block that could hold it. `Some(None)` means it was deleted.
+    /// Looks up a key, reading at most the block that could hold it. `Some(None)` means it was
+    /// deleted.
     pub fn get(&self, fs: &dyn Fs, key: &[u8]) -> io::Result<Option<Option<Vec<u8>>>> {
+        if !bloom::may_contain(&self.filter, key) {
+            return Ok(None);
+        }
         let block = self
             .index
             .partition_point(|(first, _)| first.as_slice() <= key);
